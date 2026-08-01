@@ -1,60 +1,136 @@
-# blendshapedeformer — VRChat向けBlendShape生成の研究構想
+# blendshapedeformer — BlendShape転送の検証基準と研究構想
 
 **リポジトリ:** https://github.com/KAFKA2306/blendshapedeformer
 
-VRChatアバターのVisemeや表情BlendShapeを、機械学習による頂点オフセット推定で補助生成するための設計・研究メモです。
+VRChatアバターのViseme・表情BlendShape生成を研究するリポジトリです。現在は、機械学習や異種トポロジ転送ではなく、**同一トポロジ・同一頂点順のメッシュ間で頂点オフセットを移す決定論的ベースライン**を実装しています。
 
-現在のリポジトリでは、学習データ、学習済みモデル、再現可能な訓練コード、Blenderアドオン、Unity統合パッケージを一式として確認できません。したがって、README内のコード断片や性能値は**実装済み製品の仕様ではなく、構想例**として扱います。
+## 現在実行できる処理
 
-## 目標としている処理
+`src/blendshape_transfer.py`は次を行います。
 
-```text
-基準メッシュと正解Shape Keyを収集
-  → トポロジ・頂点順・座標系を検証
-  → 頂点オフセットを学習データ化
-  → 条件付きモデルを訓練
-  → 未知アバターへオフセットを推定
-  → BlenderでShape Key候補を生成
-  → 人間が表情・口形・破綻を修正
-  → Unity / VRChatで実動作確認
+1. 基準メッシュ、変形済みメッシュ、転送先基準メッシュを`(N, 3)`配列として検証
+2. NaN、無限値、頂点数不一致を拒否
+3. 面配列がある場合は、面数・頂点インデックス・順序の完全一致を検証
+4. `source_shape - source_base`から頂点オフセットを計算
+5. 同じオフセットを`target_base`へ適用
+6. 最大移動量、平均移動量、トポロジSHA-256を記録
+7. NPZとJSONメタデータを出力
+
+この処理は機械学習ではなく、異なるトポロジへは使用できません。
+
+## セットアップ
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
 ```
 
-## 想定する対象
+Windowsでは仮想環境の有効化コマンドを環境に合わせて変更してください。
 
-- VRChat標準Viseme候補
-- まばたき
-- 基本表情
-- 強度スライダーに応じた頂点変形
-- 既存アバターから別アバターへの転移学習研究
+## 入力形式
 
-## 実現に必要な前提
+NPZへ次の配列を保存します。
 
-### 同一トポロジの場合
+```text
+source_base   float[N, 3]
+source_shape  float[N, 3]
+target_base   float[N, 3]
+source_faces  int[M, K]  # 推奨・CLIでは検証対象
+target_faces  int[M, K]
+```
 
-頂点数、頂点順、座標系が一致していれば、Shape Keyの頂点オフセットを直接比較できます。
+例:
 
-### 異なるトポロジの場合
+```python
+import numpy as np
 
-単純な頂点番号対応は使えません。次のような追加処理が必要です。
+np.savez_compressed(
+    "input.npz",
+    source_base=source_base,
+    source_shape=source_shape,
+    target_base=target_base,
+    source_faces=source_faces,
+    target_faces=target_faces,
+)
+```
+
+実行:
+
+```bash
+python -m src.blendshape_transfer \
+  input.npz output.npz \
+  --confirmed-same-topology \
+  --max-displacement 0.05
+```
+
+`--max-displacement`の単位は入力座標と同じです。メートル、センチメートルなどをコードが自動判定しないため、アセットの単位に合わせて明示してください。
+
+出力:
+
+```text
+output.npz
+  target_shape
+  offsets
+  target_faces  # 入力に存在した場合
+
+output.npz.json
+  method
+  vertex_count
+  topology_sha256
+  maximum_displacement
+  mean_displacement
+  generated_at_utc
+```
+
+## API
+
+```python
+from src.blendshape_transfer import transfer_same_topology
+
+target_shape, offsets, metadata = transfer_same_topology(
+    source_base,
+    source_shape,
+    target_base,
+    source_faces=source_faces,
+    target_faces=target_faces,
+    max_displacement=0.05,
+)
+```
+
+面配列を渡さない場合、呼出側が頂点順・面順を別手段で検証した上で、`confirmed_same_topology=True`を明示する必要があります。
+
+## この実装が保証しないこと
+
+- 異なる頂点数・面構成への転送
+- 顔ランドマークの自動対応
+- Blender Shape Keyへの直接書込み
+- Unity FBXインポート
+- VRChat Viseme名への割当
+- 歯、舌、口内、まぶたとの干渉回避
+- 見た目の自然さ
+- 販売品質や公式対応
+
+同一トポロジでも、基準形状の比率・骨格・法線・口内構造が違えば、同じオフセットで自然な表情になるとは限りません。
+
+## 将来の研究対象
+
+異なるトポロジへ進む場合は、単純な頂点番号対応を使用できません。少なくとも次が必要です。
 
 - 顔領域のランドマーク対応
 - 表面上の対応点推定
-- UV・距離場・局所座標による特徴表現
-- リターゲット誤差の評価
-- 口内、歯、舌、まぶたなどの構造差への対応
+- UV、距離場、局所座標による特徴表現
+- 口内、歯、舌、まぶたの構造差への対応
+- 学習・検証・OOSテストの分離
+- 頂点誤差だけでなく、口唇閉鎖やViseme認識の評価
+- Blender、Unity、VRChat内での実動作検証
 
-「トポロジ非依存」を主張するには、複数アバターを使ったOOS評価が必要です。
-
-## 必要な成果物
-
-実行可能なプロジェクトへ進めるには、少なくとも次が必要です。
+## 必要な将来成果物
 
 ```text
 data/
   manifest.json
-  train/
-  validation/
-  test/
 models/
   model.onnx
   model-card.md
@@ -63,49 +139,17 @@ training/
   train.py
   evaluate.py
 blender-addon/
-  __init__.py
-  operators.py
-  inference.py
 unity/
-  Editor/
 tests/
 ```
 
-## 評価項目
-
-- 頂点位置誤差
-- 法線・曲率の変化
-- 口唇閉鎖、母音形状、歯・舌との干渉
-- 左右対称性
-- 極端な頂点移動
-- 未学習アバターに対するOOS性能
-- 人間による表情自然さ評価
-- Unityインポート後のBlendShape保持
-- VRChatクライアント内のViseme動作
-
-## READMEから削除した未検証主張
-
-以前のREADMEには次のような数値・表現がありましたが、対応する実験記録を確認できないため、仕様としては採用しません。
-
-- 数十時間から数分への短縮
-- 100体での事前学習
-- 6時間以内の適応
-- 品質保証
-- 市場に同等ツールが存在しないという断定
-- 特定の精度・成功率
-
-これらを再掲載する場合は、データセット、実験条件、比較対象、コード、結果ファイルを添付してください。
+現時点では、学習データ、学習済みモデル、訓練コード、Blenderアドオン、Unity統合パッケージは未実装です。
 
 ## 安全・権利上の注意
 
-- 購入アバターのメッシュやShape Keyを学習データとして再配布しないでください
+- 購入アバターのメッシュやShape Keyを再配布しないでください
 - アバターごとの利用規約と機械学習利用可否を確認してください
-- 学習済みモデルが元アセットの形状情報を含む可能性を評価してください
 - 自動生成結果を公式対応・完全互換として販売しないでください
-- 顔表現は視覚品質だけでなく、リップシンク・アクセシビリティにも影響します
+- 顔表現は視覚品質だけでなく、リップシンクやアクセシビリティにも影響します
 
-## 現在の位置づけ
-
-本リポジトリは、BlendShape自動生成の問題設定と設計検討を保存する研究ノートです。実用アドオンとして利用する段階には達していません。
-
-**README最終監査:** 2026-08-01
+**README最終監査:** 2026-08-02
