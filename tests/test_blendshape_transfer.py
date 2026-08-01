@@ -45,7 +45,9 @@ class BlendShapeTransferTests(unittest.TestCase):
             )
 
     def test_missing_topology_requires_explicit_confirmation(self):
-        with self.assertRaisesRegex(BlendShapeValidationError, "confirmation"):
+        with self.assertRaisesRegex(
+            BlendShapeValidationError, "confirmed_same_topology"
+        ):
             transfer_same_topology(
                 self.source_base, self.source_shape, self.target_base
             )
