@@ -1,5 +1,7 @@
 # blendshapedeformer — BlendShape転送の検証基準と研究構想
 
+[![BlendShape baseline tests](https://github.com/KAFKA2306/blendshapedeformer/actions/workflows/baseline-tests.yml/badge.svg)](https://github.com/KAFKA2306/blendshapedeformer/actions/workflows/baseline-tests.yml)
+
 **リポジトリ:** https://github.com/KAFKA2306/blendshapedeformer
 
 VRChatアバターのViseme・表情BlendShape生成を研究するリポジトリです。現在は、機械学習や異種トポロジ転送ではなく、**同一トポロジ・同一頂点順のメッシュ間で頂点オフセットを移す決定論的ベースライン**を実装しています。
