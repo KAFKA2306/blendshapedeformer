@@ -147,14 +147,84 @@ def _load_npz(path: Path) -> dict[str, np.ndarray]:
         raise BlendShapeValidationError(f"cannot read NPZ input: {exc}") from exc
 
 
-def _atomic_write_npz(path: Path, **arrays: Any) -> None:
+def _write_npz(path: Path, **arrays: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("wb") as handle:
+    with path.open("wb") as handle:
         np.savez_compressed(handle, **arrays)
         handle.flush()
         os.fsync(handle.fileno())
-    temporary.replace(path)
+
+
+def _atomic_write_npz(path: Path, **arrays: Any) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        _write_npz(temporary, **arrays)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise BlendShapeValidationError(f"cannot read persisted NPZ: {exc}") from exc
+    return digest.hexdigest()
+
+
+def verify_output_pair(path: Path) -> dict[str, Any]:
+    """Return metadata only when the sidecar is bound to the exact NPZ bytes."""
+
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BlendShapeValidationError(f"cannot read output metadata: {exc}") from exc
+    expected = metadata.get("output_npz_sha256")
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise BlendShapeValidationError("output metadata has no valid output_npz_sha256")
+    actual = _sha256_file(path)
+    if actual != expected:
+        raise BlendShapeValidationError(
+            "output NPZ does not match metadata output_npz_sha256"
+        )
+    return metadata
+
+
+def _write_output_pair(
+    path: Path, arrays: dict[str, Any], metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Stage both outputs, publish metadata first, then publish its bound NPZ.
+
+    Publishing the sidecar first means a metadata-finalization failure cannot
+    expose a newly published NPZ. During the final two replacements, any partial
+    state fails verify_output_pair() rather than looking complete.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    npz_staging = path.with_name(path.name + ".pair.tmp")
+    metadata_staging = metadata_path.with_name(metadata_path.name + ".pair.tmp")
+    try:
+        _write_npz(npz_staging, **arrays)
+        bound_metadata = dict(metadata)
+        bound_metadata["output_npz_sha256"] = _sha256_file(npz_staging)
+        with metadata_staging.open("w", encoding="utf-8") as handle:
+            json.dump(bound_metadata, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        metadata_staging.replace(metadata_path)
+        npz_staging.replace(path)
+        verify_output_pair(path)
+        return bound_metadata
+    finally:
+        npz_staging.unlink(missing_ok=True)
+        metadata_staging.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -203,10 +273,7 @@ def main() -> int:
     }
     if target_faces is not None:
         output_arrays["target_faces"] = target_faces
-    _atomic_write_npz(args.output, **output_arrays)
-    args.output.with_suffix(args.output.suffix + ".json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_output_pair(args.output, output_arrays, metadata)
     print(args.output)
     return 0
 
