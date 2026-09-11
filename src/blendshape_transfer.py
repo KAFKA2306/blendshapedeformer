@@ -147,14 +147,103 @@ def _load_npz(path: Path) -> dict[str, np.ndarray]:
         raise BlendShapeValidationError(f"cannot read NPZ input: {exc}") from exc
 
 
-def _atomic_write_npz(path: Path, **arrays: Any) -> None:
+def _stage_npz(path: Path, **arrays: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("wb") as handle:
         np.savez_compressed(handle, **arrays)
         handle.flush()
         os.fsync(handle.fileno())
-    temporary.replace(path)
+    return temporary
+
+
+def _stage_bytes(path: Path, raw: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return temporary
+
+
+def _replace_file(source: Path, target: Path) -> None:
+    os.replace(source, target)
+
+
+def _atomic_write_npz(path: Path, **arrays: Any) -> None:
+    temporary = _stage_npz(path, **arrays)
+    try:
+        _replace_file(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def verify_output_pair(path: Path) -> dict[str, Any]:
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    if not path.is_file() or not metadata_path.is_file():
+        raise BlendShapeValidationError("output NPZ and metadata must both exist")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BlendShapeValidationError(f"cannot read output metadata: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise BlendShapeValidationError("output metadata must be a JSON object")
+    raw = path.read_bytes()
+    actual_hash = hashlib.sha256(raw).hexdigest()
+    if metadata.get("output_npz_sha256") != actual_hash:
+        raise BlendShapeValidationError("output metadata SHA-256 does not match NPZ bytes")
+    if metadata.get("output_npz_size_bytes") != len(raw):
+        raise BlendShapeValidationError("output metadata byte size does not match NPZ bytes")
+    _load_npz(path)
+    return metadata
+
+
+def _write_output_pair(
+    path: Path, arrays: dict[str, Any], metadata: dict[str, Any]
+) -> None:
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    npz_temporary = _stage_npz(path, **arrays)
+    metadata_temporary: Path | None = None
+    previous_metadata = metadata_path.read_bytes() if metadata_path.exists() else None
+    try:
+        npz_raw = npz_temporary.read_bytes()
+        pair_metadata = dict(metadata)
+        pair_metadata.update(
+            {
+                "output_npz_sha256": hashlib.sha256(npz_raw).hexdigest(),
+                "output_npz_size_bytes": len(npz_raw),
+            }
+        )
+        metadata_raw = (
+            json.dumps(pair_metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        metadata_temporary = _stage_bytes(metadata_path, metadata_raw)
+
+        # Publish metadata first. If this step fails, the new NPZ is never exposed.
+        _replace_file(metadata_temporary, metadata_path)
+        metadata_temporary = None
+        try:
+            _replace_file(npz_temporary, path)
+            npz_temporary = None
+        except Exception:
+            # Restore the prior metadata so a failed NPZ finalization does not destroy
+            # an already-valid pair. If there was no prior sidecar, remove the staged one.
+            if previous_metadata is None:
+                metadata_path.unlink(missing_ok=True)
+            else:
+                rollback = _stage_bytes(metadata_path, previous_metadata)
+                try:
+                    _replace_file(rollback, metadata_path)
+                finally:
+                    rollback.unlink(missing_ok=True)
+            raise
+        verify_output_pair(path)
+    finally:
+        if metadata_temporary is not None:
+            metadata_temporary.unlink(missing_ok=True)
+        if npz_temporary is not None:
+            npz_temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -203,10 +292,7 @@ def main() -> int:
     }
     if target_faces is not None:
         output_arrays["target_faces"] = target_faces
-    _atomic_write_npz(args.output, **output_arrays)
-    args.output.with_suffix(args.output.suffix + ".json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_output_pair(args.output, output_arrays, metadata)
     print(args.output)
     return 0
 
